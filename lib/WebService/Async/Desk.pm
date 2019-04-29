@@ -1,7 +1,10 @@
 package WebService::Async::Desk;
+# ABSTRACT: Support for the desk.com customer service ERM
 
 use strict;
 use warnings;
+
+our $VERSION = '1.000';
 
 use parent qw(IO::Async::Notifier);
 
