@@ -41,7 +41,8 @@ for my $type (qw(
         $html->eof;
         my ($section) = map $_->look_down(_tag => 'table'), map $_->right, $html->look_down(_tag => 'h4', sub { shift->as_text =~ /Fields/ });
 
-        # Depluralised version of the type
+        # Depluralised version of the type - nasty custom logic in here, but given that this isn't
+        # ever likely to change we can get away with it for now.
         my $entity_name = ucfirst $type;
         $entity_name = 'Company' if $type eq 'companies';
         $entity_name =~ s{s$}{};
@@ -100,7 +101,7 @@ binary.com C<< BINARY@cpan.org >>
 
 Copyright binary.com 2017-2019. Licensed under the same terms as Perl itself.
 
-}, { entity_name => $entity_name, field_list => \@fields }, 'lib/WebService/Async/Desk/' . $entity_name . '.pm') or die $tt->error;
+}, { entity_name => $entity_name, field_list => \@fields }, 'lib/WebService/Async/Desk/Base/' . $entity_name . '.pm') or die $tt->error;
     } catch {
         $log->errorf('Failed to process %s - %s', $type, $@);
     }
