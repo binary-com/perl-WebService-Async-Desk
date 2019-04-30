@@ -8,6 +8,7 @@ our $VERSION = '1.000';
 
 use parent qw(IO::Async::Notifier);
 
+no indirect;
 use mro;
 use Syntax::Keyword::Try;
 use Log::Any qw($log);
@@ -17,13 +18,14 @@ use Net::Async::OAuth::Client;
 use JSON::MaybeUTF8 qw(:v1);
 use Future::AsyncAwait;
 use Ryu::Async;
+use Future::Utils qw(repeat);
 
 use WebService::Async::Desk::Customer;
 use WebService::Async::Desk::Case;
 
 sub configure {
     my ($self, %args) = @_;
-    for(qw(key secret token token_secret http)) {
+    for(qw(key secret token token_secret ua)) {
         $self->{$_} = delete $args{$_} if exists $args{$_};
     }
     for(qw(base_uri)) {
@@ -40,8 +42,6 @@ sub token { shift->{token} }
 
 sub token_secret { shift->{token_secret} }
 
-sub http { shift->{http} }
-
 sub base_uri { shift->{base_uri} //= URI->new('https://desk.com') }
 
 sub oauth {
@@ -55,6 +55,23 @@ sub oauth {
     )
 }
 
+sub ua {
+    my ($self) = @_;
+    $self->{ua} //= do {
+        $self->add_child(
+            my $ua = Net::Async::HTTP->new(
+                fail_on_error            => 1,
+                decode_content           => 1,
+                pipeline                 => 1,
+                stall_timeout            => 60,
+                max_connections_per_host => 2,
+                user_agent               => 'Mozilla/4.0 (WebService::Async::Desk; BINARY@cpan.org; https://metacpan.org/pod/WebService::Async::Desk)',
+            )
+        );
+        $ua
+    }
+}
+
 sub http_get {
     my ($self, %args) = @_;
 
@@ -64,7 +81,7 @@ sub http_get {
     );
 
     $log->tracef("GET %s { %s }", ''. $args{uri}, \%args);
-    $self->http->GET(
+    $self->ua->GET(
         (delete $args{uri}),
         %args
     )->then(sub {
@@ -95,7 +112,7 @@ sub http_patch {
 
     $args{headers}{Authorization} = $self->oauth->authorization_header(
         method => 'PATCH',
-        uri => $args{uri}
+        uri    => $args{uri}
     );
 
     $log->tracef("PATCH %s { %s }", ''. $args{uri}, \%args);
@@ -105,9 +122,10 @@ sub http_patch {
             (delete $args{headers})->%*,
             'Content-Type' => 'application/json',
         ],
-        encode_json_utf8(\%args)
+        encode_json_utf8($args{content})
     );
-    $self->http->do_request(
+    $log->tracef('Request is %s', $req->as_string("\n"));
+    $self->ua->do_request(
         request => $req,
     )->then(sub {
         my ($resp) = @_;
@@ -161,7 +179,7 @@ async sub oauth_login {
     $req->header('Connection' => 'close');
     $req->header('Accept' => '*/*');
     try {
-        my ($resp) = await $self->http->do_request(
+        my ($resp) = await $self->ua->do_request(
             request => $req,
         );
         $log->debugf("RequestToken response was %s", $resp->as_string("\n"));
@@ -200,7 +218,7 @@ async sub oauth_login {
         $req->header('Host' => $uri->host);
         $req->header('Connection' => 'close');
         $req->header('Accept' => '*/*');
-        ($resp) = await $self->http->do_request(
+        ($resp) = await $self->ua->do_request(
             request => $req,
         );
         $log->tracef("GetAccessToken response was %s", $resp->as_string("\n"));
@@ -230,39 +248,100 @@ sub ryu {
     }
 }
 
-sub new_source {
+sub source {
     shift->ryu->source
 }
 
-sub company_list {
-	my ($self, %args) = @_;
+=head2 paging
 
-    my $src = $self->new_source;
-    my $uri = $self->base_uri->clone;
-    $uri->path('/api/v2/companies');
-    $self->http_get(
-        uri => $uri,
-    )->then(sub {
-        my ($res) = @_;
-        try {
-            $src->emit($_) for map { WebService::Async::Desk::Company->new(desk => $self, %$_) } $res->{_embedded}{entries}->@*;
-            $src->done;
-            Future->done;
-        } catch {
-            $log->errorf('Failed - %s', $@);
-            Future->fail($@);
-        }
-    })->retain;
+Supports paging through HTTP GET requests.
+
+=over 4
+
+=item * C<$starting_uri> - the initial L<URI> to request
+
+=item * C<$factory> - a C<sub> that we will call with a L<Ryu::Source> and expect to return
+a second response-processing C<sub>.
+
+=back
+
+Returns a L<Ryu::Source>.
+
+=cut
+
+sub paging {
+    my ($self, $starting_uri, $factory) = @_;
+    my $uri = ref($starting_uri)
+    ? $starting_uri->clone
+    : URI->new($starting_uri);
+
+    my $src = $self->source;
+    my $f = $src->completed;
+    my $code = $factory->($src);
+    (repeat {
+        $log->tracef('GET %s', "$uri");
+        $self->rate_limiting->then(sub {
+            $self->http_get(uri => $uri)
+        })->then(sub {
+            try {
+                my ($data) = @_;
+                $log->tracef('Have response %s', $data);
+                my ($total) = $data->{total_entries};
+                $log->tracef('Expected total count %d', $total);
+                $code->($data);
+                $log->tracef('Links are %s', $data->{_links});
+                if(my $next = $data->{_links}{next}{href}) {
+                    $uri->path_query($next);
+                } else {
+                    $f->done unless $f->is_ready;
+                }
+                return Future->done;
+            } catch {
+                my ($err) = $@;
+                $log->errorf('Failed - %s', $err);
+                return Future->fail($err);
+            }
+        }, sub {
+            my ($err, @details) = @_;
+            $log->errorf('Failed to request %s: %s', $uri, $err);
+            $src->completed->fail($err, @details) unless $src->completed->is_ready;
+            Future->fail($err, @details);
+        })
+    } until => sub { $f->is_ready })->retain;
     return $src;
 }
 
+=head2 rate_limiting
+
+Applies rate limiting check.
+
+Returns a L<Future> which will resolve once it's safe to send further requests.
+
+=cut
+
+sub rate_limiting {
+    my ($self) = @_;
+    $self->{rate_limit} //= do {
+        $self->loop->delay_future(
+            after => 60
+        )->on_ready(sub {
+            $self->{request_count} = 0;
+            delete $self->{rate_limit};
+        })
+    };
+    return Future->done unless $self->requests_per_minute and ++$self->{request_count} >= $self->requests_per_minute;
+    return $self->{rate_limit};
+}
+
+sub requests_per_minute { shift->{requests_per_minute} //= 300 }
+
 my %type_plural = (
-    case => 'cases',
+    case     => 'cases',
     customer => 'customers',
-    company => 'companies',
+    company  => 'companies',
 );
 my %package_name_map = ();
-for (qw(case customer company)) {
+for (keys %type_plural) {
     my $type = $_;
     my $plural = $type_plural{$type};
     my $pkg = 'WebService::Async::Desk::' . ($package_name_map{$type} // ucfirst($type));
@@ -270,23 +349,19 @@ for (qw(case customer company)) {
         my $code = sub {
             my ($self, %args) = @_;
 
-            my $src = $self->new_source;
             my $uri = $self->base_uri->clone;
             $uri->path('/api/v2/' . $plural);
-            $self->http_get(
-                uri => $uri,
-            )->then(sub {
-                my ($res) = @_;
-                try {
-                    $src->emit($_) for map { $pkg->new(desk => $self, %$_) } $res->{_embedded}{entries}->@*;
-                    $src->completed->done unless $src->completed->is_ready;
-                    Future->done;
-                } catch {
-                    $log->errorf('Failed - %s', $@);
-                    Future->fail($@);
+            return $self->paging($uri => sub {
+                my ($src) = @_;
+                sub {
+                    my ($data) = @_;
+                    for my $item ($data->{_embedded}{entries}->@*) {
+                        last if $src->completed->is_ready;
+                        my $entry = $pkg->new(desk => $self, %$item);
+                        $src->emit($entry);
+                    }
                 }
-            })->retain;
-            return $src;
+            });
         };
         my $method_name = $type . '_list';
         {
@@ -316,7 +391,9 @@ for (qw(case customer company)) {
         my $code = async sub {
             my ($self, @args) = @_;
 
-            my %args = @args > 1 ? @args : (id => @args);
+            my %args = (@args > 1)
+            ? @args
+            : (id => @args);
             my $id = delete $args{id};
             my $uri = $self->base_uri->clone;
             $uri->path('/api/v2/' . $plural . '/' . $id);
