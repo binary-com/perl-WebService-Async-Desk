@@ -23,14 +23,22 @@ $loop->add(
 my $tt = Template->new(
     ENCODING => 'UTF-8',
 );
+my %map_types = (
+    replies => 'cases',
+    links => 'cases',
+    attachments => 'cases',
+    notes => 'cases',
+);
 for my $type (qw(
     cases articles customers brands custom-fields groups feedbacks insights jobs
     labels macros permissions rules site-settings snippets system-message topics users
+    replies links attachments notes
 )) {
     my $data = do {
-        my $path = path($type . '.html');
+        my $local_type = $map_types{$type} // $type;
+        my $path = path($local_type . '.html');
         $path->exists ? $path->slurp_utf8 : do {
-            my $resp = $ua->GET('http://dev.desk.com/API/' . $type)->get;
+            my $resp = $ua->GET('http://dev.desk.com/API/' . $local_type)->get;
             $path->spew_utf8(my $txt = $resp->decoded_content);
             $txt
         }
@@ -39,14 +47,23 @@ for my $type (qw(
         my $html = HTML::TreeBuilder->new(no_space_compacting => 1);
         $html->parse($data);
         $html->eof;
-        my ($section) = map $_->look_down(_tag => 'table'), map $_->right, $html->look_down(_tag => 'h4', sub { shift->as_text =~ /Fields/ });
-
         # Depluralised version of the type - nasty custom logic in here, but given that this isn't
         # ever likely to change we can get away with it for now.
         my $entity_name = ucfirst $type;
         $entity_name = 'Company' if $type eq 'companies';
+        $entity_name = 'Reply' if $type eq 'replies';
         $entity_name =~ s{s$}{};
         $entity_name =~ s{-(.)}{\U$1}g;
+
+        my $section_id = $map_types{$type} ? $type . '-fields' : 'fields';
+        warn $html->look_down(
+            id => $section_id
+        ) . ' for ' . $section_id;
+        my ($section) = map {
+            $_->look_down(_tag => 'table')
+        } $html->look_down(
+            id => $section_id
+        );
 
         my @fields;
         for my $row ($section->look_down(_tag => 'tr')) {

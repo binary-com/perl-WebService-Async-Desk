@@ -15,6 +15,7 @@ use Log::Any qw($log);
 use URI;
 use URI::QueryParam;
 use Net::Async::OAuth::Client;
+use Net::Async::HTTP;
 use JSON::MaybeUTF8 qw(:v1);
 use Future::AsyncAwait;
 use Ryu::Async;
@@ -22,6 +23,9 @@ use Future::Utils qw(repeat);
 
 use WebService::Async::Desk::Customer;
 use WebService::Async::Desk::Case;
+use WebService::Async::Desk::Reply;
+use WebService::Async::Desk::Note;
+use WebService::Async::Desk::Attachment;
 
 sub configure {
     my ($self, %args) = @_;
@@ -64,7 +68,7 @@ sub ua {
                 decode_content           => 1,
                 pipeline                 => 1,
                 stall_timeout            => 60,
-                max_connections_per_host => 2,
+                max_connections_per_host => 4,
                 user_agent               => 'Mozilla/4.0 (WebService::Async::Desk; BINARY@cpan.org; https://metacpan.org/pod/WebService::Async::Desk)',
             )
         );
@@ -90,7 +94,7 @@ sub http_get {
         return { } if $resp->code == 204;
         return { } if 3 == ($resp->code / 100);
         try {
-            return Future->done(decode_json_text($resp->decoded_content))
+            return Future->done(decode_json_utf8($resp->content))
         } catch {
             $log->errorf("JSON decoding error %s from HTTP response %s", $@, $resp->as_string("\n"));
             return Future->fail($@ => json => $resp);
@@ -133,7 +137,7 @@ sub http_patch {
         return { } if $resp->code == 204;
         return { } if 3 == ($resp->code / 100);
         try {
-            return Future->done(decode_json_text($resp->decoded_content))
+            return Future->done(decode_json_utf8($resp->content))
         } catch {
             $log->errorf("JSON decoding error %s from HTTP response %s", $@, $resp->as_string("\n"));
             return Future->fail($@ => json => $resp);
@@ -336,9 +340,13 @@ sub rate_limiting {
 sub requests_per_minute { shift->{requests_per_minute} //= 300 }
 
 my %type_plural = (
-    case     => 'cases',
-    customer => 'customers',
-    company  => 'companies',
+    case       => 'cases',
+    customer   => 'customers',
+    company    => 'companies',
+    reply      => 'replies',
+    link       => 'links',
+    note       => 'notes',
+    attachment => 'attachments',
 );
 my %package_name_map = ();
 for (keys %type_plural) {
@@ -350,14 +358,26 @@ for (keys %type_plural) {
             my ($self, %args) = @_;
 
             my $uri = $self->base_uri->clone;
-            $uri->path('/api/v2/' . $plural);
+            my %extra;
+            if(my $case = delete $args{case}) {
+                $uri->path('/api/v2/cases/' . $case->id . '/' . $plural);
+                $extra{case} = $case;
+                $extra{case_id} = $case->id;
+            } elsif(my $case_id = delete $args{case_id}) {
+                $uri->path('/api/v2/cases/' . $case_id . '/' . $plural);
+                $extra{case_id} = $case_id;
+            } else {
+                $uri->path('/api/v2/' . $plural);
+            }
+            $uri->query_param(per_page => 200);
+            $uri->query_param($_ => $args{$_}) for keys %args;
             return $self->paging($uri => sub {
                 my ($src) = @_;
                 sub {
                     my ($data) = @_;
                     for my $item ($data->{_embedded}{entries}->@*) {
                         last if $src->completed->is_ready;
-                        my $entry = $pkg->new(desk => $self, %$item);
+                        my $entry = $pkg->new(desk => $self, %extra, %$item);
                         $src->emit($entry);
                     }
                 }
