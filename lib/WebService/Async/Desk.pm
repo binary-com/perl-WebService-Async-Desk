@@ -297,7 +297,7 @@ sub paging {
                 if(my $next = $data->{_links}{next}{href}) {
                     $uri->path_query($next);
                 } else {
-                    $f->done unless $f->is_ready;
+                    $src->finish;
                 }
                 return Future->done;
             } catch {
@@ -308,7 +308,7 @@ sub paging {
         }, sub {
             my ($err, @details) = @_;
             $log->errorf('Failed to request %s: %s', $uri, $err);
-            $src->completed->fail($err, @details) unless $src->completed->is_ready;
+            $src->fail($err, @details) unless $src->is_ready;
             Future->fail($err, @details);
         })
     } until => sub { $f->is_ready })->retain;
@@ -376,7 +376,7 @@ for (keys %type_plural) {
                 sub {
                     my ($data) = @_;
                     for my $item ($data->{_embedded}{entries}->@*) {
-                        last if $src->completed->is_ready;
+                        last if $src->is_ready;
                         my $entry = $pkg->new(desk => $self, %extra, %$item);
                         $src->emit($entry);
                     }
